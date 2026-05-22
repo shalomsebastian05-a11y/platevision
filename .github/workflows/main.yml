@@ -14,15 +14,18 @@ jobs:
 
       - name: Deploy to EC2
         uses: appleboy/ssh-action@master
-        with:
+        with:            
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_KEY }}
-script: |
-  cd ~/platevision
-  git pull origin main
-  source venv/bin/activate
-  pip install -r requirements.txt
-  sudo fuser -k 5000/tcp || true
-  nohup python3 app.py > app.log 2>&1 &
-  echo "Deployment successful!"
+          command_timeout: 30m
+          script: |
+            cd ~/platevision
+            git pull origin main
+            source venv/bin/activate
+            pip install -r requirements.txt
+            sudo fuser -k 5000/tcp || true
+            sleep 2
+            nohup python3 app.py > ~/app.log 2>&1 &
+            disown
+            echo "Deployment Done!"
