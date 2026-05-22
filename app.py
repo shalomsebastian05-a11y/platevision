@@ -137,7 +137,7 @@ def upload():
     file.save(filepath)
     try:
         import easyocr
-        reader = easyocr.Reader(['en'])
+        reader = easyocr.Reader(['en'], gpu=False)
         results = reader.readtext(filepath)
         plate_text = ''
         for (bbox, text, prob) in results:
