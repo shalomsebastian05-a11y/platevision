@@ -18,10 +18,11 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_KEY }}
-          script: |
-            cd ~/platevision
-            git pull origin main
-            source venv/bin/activate
-            pip install -r requirements.txt
-            sudo fuser -k 5000/tcp
-            nohup python3 app.py &
+script: |
+  cd ~/platevision
+  git pull origin main
+  source venv/bin/activate
+  pip install -r requirements.txt
+  sudo fuser -k 5000/tcp || true
+  nohup python3 app.py > app.log 2>&1 &
+  echo "Deployment successful!"
