@@ -1,0 +1,9 @@
+flask
+flask-bcrypt
+flask-sqlalchemy
+boto3
+easyocr
+opencv-python-headless
+python-dotenv
+psycopg2-binary
+numpy
