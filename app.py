@@ -5,7 +5,8 @@ from datetime import datetime
 import os
 import uuid
 import boto3
-import easyocr
+import pytesseract
+from PIL import Image
 import cv2
 import numpy as np
 from dotenv import load_dotenv
@@ -33,9 +34,6 @@ s3 = boto3.client(
     region_name=os.getenv('AWS_REGION', 'ap-south-1')
 )
 S3_BUCKET = os.getenv('S3_BUCKET_NAME')
-
-# ── EasyOCR reader (loaded once at startup, not per request) ─
-reader = easyocr.Reader(['en'], gpu=False)
 
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
@@ -87,38 +85,29 @@ def get_s3_url(key):
     )
 
 def preprocess(file_bytes):
-    """Grayscale + denoise + CLAHE + Otsu — returns numpy array for EasyOCR."""
     np_arr = np.frombuffer(file_bytes, np.uint8)
     img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-    # Upscale if too small
     h, w = img.shape[:2]
     if w < 600:
         scale = 600 / w
         img = cv2.resize(img, (int(w * scale), int(h * scale)),
                          interpolation=cv2.INTER_CUBIC)
-
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.fastNlMeansDenoising(gray, h=10)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
     _, thresh = cv2.threshold(gray, 0, 255,
-                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return thresh  # EasyOCR accepts numpy arrays directly
+                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return thresh
 
 def run_ocr(file_bytes):
     img_array = preprocess(file_bytes)
-    results = reader.readtext(img_array)
-    print(f"[OCR RAW]: {results}")
-
-    plate_text = ''
-    for (bbox, text, prob) in results:
-        print(f"  text='{text}' prob={prob:.2f}")
-        if prob > 0.2:
-            plate_text += text
-
-    plate_text = ''.join(e for e in plate_text if e.isalnum()).upper().strip()
-    return plate_text if plate_text else 'UNREADABLE'
+    pil_img = Image.fromarray(img_array)
+    config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+    text = pytesseract.image_to_string(pil_img, config=config)
+    plate = ''.join(e for e in text if e.isalnum()).upper().strip()
+    print(f"[OCR RESULT]: {plate}")
+    return plate if plate else 'UNREADABLE'
 
 # ── Routes ─────────────────────────────────────────────────
 @app.route('/')
@@ -205,10 +194,10 @@ def upload():
 
     file_bytes = file.read()
 
-    # 1. OCR (in memory)
+    # 1. OCR in memory
     plate_text = run_ocr(file_bytes)
 
-    # 2. Upload original to S3
+    # 2. Upload to S3
     s3_key = upload_to_s3(file_bytes, file.filename,
                            file.content_type or 'image/jpeg')
 
