@@ -103,7 +103,7 @@ def preprocess(file_bytes):
 def run_ocr(file_bytes):
     img_array = preprocess(file_bytes)
     pil_img = Image.fromarray(img_array)
-    config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+    config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
     text = pytesseract.image_to_string(pil_img, config=config)
     plate = ''.join(e for e in text if e.isalnum()).upper().strip()
     print(f"[OCR RESULT]: {plate}")
