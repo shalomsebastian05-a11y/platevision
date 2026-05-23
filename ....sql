@@ -1,3 +1,0 @@
-ALTER USER 'root'@'localhost' 
-IDENTIFIED BY 'admin123';
-FLUSH PRIVILEGES;
