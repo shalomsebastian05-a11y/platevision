@@ -3,24 +3,44 @@ from flask_bcrypt import Bcrypt
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 import os
+import uuid
+import boto3
+import easyocr
+import cv2
+import numpy as np
 from dotenv import load_dotenv
-import os
+
 load_dotenv()
 
 app = Flask(__name__)
+
 @app.after_request
 def add_security_headers(response):
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'SAMEORIGIN'
     response.headers['X-XSS-Protection'] = '1; mode=block'
     return response
-app.secret_key = 'mysecretkey123'
+
+app.secret_key = os.getenv('SECRET_KEY', 'mysecretkey123')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# ── S3 ─────────────────────────────────────────────────────
+s3 = boto3.client(
+    's3',
+    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+    region_name=os.getenv('AWS_REGION', 'ap-south-1')
+)
+S3_BUCKET = os.getenv('S3_BUCKET_NAME')
+
+# ── EasyOCR reader (loaded once at startup, not per request) ─
+reader = easyocr.Reader(['en'], gpu=False)
 
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
 
+# ── Models ─────────────────────────────────────────────────
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100))
@@ -33,7 +53,7 @@ class VehicleLog(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer)
     plate_number = db.Column(db.String(20))
-    image_path = db.Column(db.String(255))
+    image_s3_key = db.Column(db.String(255))
     entry_time = db.Column(db.DateTime, default=datetime.utcnow)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
@@ -42,15 +62,65 @@ with app.app_context():
     admin = User.query.filter_by(email='admin@plate.com').first()
     if not admin:
         hashed = bcrypt.generate_password_hash('admin123').decode('utf-8')
-        admin = User(
-            name='Admin',
-            email='admin@plate.com',
-            password_hash=hashed,
-            role='admin'
-        )
+        admin = User(name='Admin', email='admin@plate.com',
+                     password_hash=hashed, role='admin')
         db.session.add(admin)
         db.session.commit()
 
+# ── Helpers ────────────────────────────────────────────────
+def upload_to_s3(file_bytes, original_filename, content_type='image/jpeg'):
+    ext = os.path.splitext(original_filename)[1].lower() or '.jpg'
+    key = f"plates/{uuid.uuid4().hex}{ext}"
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=key,
+        Body=file_bytes,
+        ContentType=content_type
+    )
+    return key
+
+def get_s3_url(key):
+    return s3.generate_presigned_url(
+        'get_object',
+        Params={'Bucket': S3_BUCKET, 'Key': key},
+        ExpiresIn=3600
+    )
+
+def preprocess(file_bytes):
+    """Grayscale + denoise + CLAHE + Otsu — returns numpy array for EasyOCR."""
+    np_arr = np.frombuffer(file_bytes, np.uint8)
+    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+    # Upscale if too small
+    h, w = img.shape[:2]
+    if w < 600:
+        scale = 600 / w
+        img = cv2.resize(img, (int(w * scale), int(h * scale)),
+                         interpolation=cv2.INTER_CUBIC)
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.fastNlMeansDenoising(gray, h=10)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+    _, thresh = cv2.threshold(gray, 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return thresh  # EasyOCR accepts numpy arrays directly
+
+def run_ocr(file_bytes):
+    img_array = preprocess(file_bytes)
+    results = reader.readtext(img_array)
+    print(f"[OCR RAW]: {results}")
+
+    plate_text = ''
+    for (bbox, text, prob) in results:
+        print(f"  text='{text}' prob={prob:.2f}")
+        if prob > 0.2:
+            plate_text += text
+
+    plate_text = ''.join(e for e in plate_text if e.isalnum()).upper().strip()
+    return plate_text if plate_text else 'UNREADABLE'
+
+# ── Routes ─────────────────────────────────────────────────
 @app.route('/')
 def home():
     if 'user_id' not in session:
@@ -68,11 +138,7 @@ def register():
         if existing:
             flash('Email already exists!', 'danger')
         else:
-            user = User(
-                name=name,
-                email=email,
-                password_hash=password
-            )
+            user = User(name=name, email=email, password_hash=password)
             db.session.add(user)
             db.session.commit()
             flash('Registration successful!', 'success')
@@ -85,8 +151,7 @@ def login():
         email = request.form['email']
         password = request.form['password']
         user = User.query.filter_by(email=email).first()
-        if user and bcrypt.check_password_hash(
-            user.password_hash, password):
+        if user and bcrypt.check_password_hash(user.password_hash, password):
             session['user_id'] = user.id
             session['user_name'] = user.name
             session['user_role'] = user.role
@@ -105,16 +170,13 @@ def logout():
 def dashboard():
     if 'user_id' not in session:
         return redirect(url_for('login'))
-    logs = VehicleLog.query.filter_by(
-        user_id=session['user_id']).all()
+    logs = VehicleLog.query.filter_by(user_id=session['user_id']).all()
     total_scans = len(logs)
-    successful = len([l for l in logs
-                     if l.plate_number != 'UNREADABLE'])
+    successful = len([l for l in logs if l.plate_number != 'UNREADABLE'])
+    for log in logs:
+        log.image_url = get_s3_url(log.image_s3_key) if log.image_s3_key else None
     return render_template('user/dashboard.html',
-        logs=logs,
-        total_scans=total_scans,
-        successful=successful
-    )
+        logs=logs, total_scans=total_scans, successful=successful)
 
 @app.route('/admin')
 def admin_dashboard():
@@ -124,11 +186,10 @@ def admin_dashboard():
     total_logs = VehicleLog.query.count()
     recent_logs = VehicleLog.query.order_by(
         VehicleLog.created_at.desc()).limit(10).all()
+    for log in recent_logs:
+        log.image_url = get_s3_url(log.image_s3_key) if log.image_s3_key else None
     return render_template('admin/dashboard.html',
-        total_users=total_users,
-        total_logs=total_logs,
-        recent_logs=recent_logs
-    )
+        total_users=total_users, total_logs=total_logs, recent_logs=recent_logs)
 
 @app.route('/upload', methods=['POST'])
 def upload():
@@ -141,33 +202,25 @@ def upload():
     if file.filename == '':
         flash('No image selected!', 'danger')
         return redirect(url_for('dashboard'))
-    filename = file.filename
-    filepath = os.path.join('uploads', filename)
-    file.save(filepath)
-    try:
-        import easyocr
-        reader = easyocr.Reader(['en'], gpu=False)
-        results = reader.readtext(filepath)
-        plate_text = ''
-        for (bbox, text, prob) in results:
-            if prob > 0.3:
-                plate_text += text
-        plate_text = ''.join(
-            e for e in plate_text if e.isalnum()
-        )
-        plate_text = plate_text.upper().strip()
-        if not plate_text:
-            plate_text = 'UNREADABLE'
-    except Exception as e:
-        print(f"Error: {e}")
-        plate_text = 'UNREADABLE'
+
+    file_bytes = file.read()
+
+    # 1. OCR (in memory)
+    plate_text = run_ocr(file_bytes)
+
+    # 2. Upload original to S3
+    s3_key = upload_to_s3(file_bytes, file.filename,
+                           file.content_type or 'image/jpeg')
+
+    # 3. Save to RDS
     log = VehicleLog(
         user_id=session['user_id'],
         plate_number=plate_text,
-        image_path=filepath
+        image_s3_key=s3_key
     )
     db.session.add(log)
     db.session.commit()
+
     flash(f'Plate detected: {plate_text}', 'success')
     return redirect(url_for('dashboard'))
 
